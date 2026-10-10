@@ -9,6 +9,33 @@ service cloud.firestore {
       allow create: if request.auth != null && request.resource.data.uid == request.auth.uid;
       allow update, delete: if request.auth != null && resource.data.uid == request.auth.uid;
     }
+    match /playerProfiles/{uid} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null && request.auth.uid == uid;
+      allow delete: if false;
+    }
+    match /users/{uid}/friends/{friendUid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create: if request.auth != null
+        && ((request.auth.uid == uid && request.resource.data.uid == friendUid)
+          || (request.auth.uid == friendUid && request.resource.data.uid == uid));
+      allow update, delete: if request.auth != null
+        && (request.auth.uid == uid || request.auth.uid == friendUid);
+    }
+    match /users/{uid}/friendRequests/{requestId} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create: if request.auth != null
+        && request.resource.data.fromUid == request.auth.uid
+        && request.resource.data.toUid == uid
+        && request.resource.data.status == 'pending';
+      allow update: if request.auth != null && request.auth.uid == uid
+        && resource.data.toUid == uid
+        && request.resource.data.fromUid == resource.data.fromUid
+        && request.resource.data.toUid == uid
+        && request.resource.data.status in ['accepted', 'rejected'];
+      allow delete: if request.auth != null
+        && (request.auth.uid == uid || request.auth.uid == resource.data.fromUid);
+    }
   }
 }
 
