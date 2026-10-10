@@ -13,7 +13,8 @@ La app guarda el progreso en `localStorage`, intenta registrar un service worker
 
 ## Funciones incluidas
 
-- Acceso y registro con Firebase Authentication cuando se configura el proyecto; recuperación de contraseña por email, persistencia local de sesión y reserva de nombre único en Firestore.
+- Registro e inicio de sesión con Firebase Authentication cuando se configura el proyecto. Sin Firebase, permite crear cuentas locales con contraseña derivada mediante PBKDF2; esas cuentas solo funcionan en el mismo navegador y dispositivo.
+- Recuperación de contraseña por email y sincronización entre dispositivos disponibles al configurar Firebase; los hashes de las cuentas locales no se pueden recuperar por email.
 - Guardado local y sincronización de progreso a Firestore cuando hay una cuenta Firebase configurada.
 - Pizzería dibujada con Phaser, recetas desbloqueables, pedidos, inventario, preparación y ventas.
 - Contratación, entrenamiento, cansancio, vacaciones y salarios de empleados.
@@ -28,7 +29,7 @@ La app guarda el progreso en `localStorage`, intenta registrar un service worker
 2. Activa Email/Password en Firebase Authentication y crea la base Firestore.
 3. Publica `firestore.rules` en el proyecto Firebase.
 
-Sin esa configuración, la aplicación usa un perfil de demostración guardado localmente. No guarda contraseñas localmente.
+Sin esa configuración, el usuario puede registrarse e iniciar sesión localmente en el mismo dispositivo. La contraseña no se guarda en texto plano; se almacena un hash PBKDF2 con sal en `localStorage`. Para cuentas compartidas entre dispositivos, configura Firebase.
 
 ## Integraciones comerciales pendientes
 

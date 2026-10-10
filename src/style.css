@@ -5,4 +5,5 @@
 @media(max-width:390px){.stat-chip.reputation{display:none}.right-column{grid-template-columns:1fr}.inventory{grid-row:auto}.view-head .pill{white-space:normal}.employee-detail{padding-left:0}.marketing-card{padding:11px}.scene-footer{font-size:8px}}
 /* Acceso y recuperación de cuenta */
 .auth-links{display:flex;justify-content:space-between;gap:10px;margin-top:12px}.auth-links button{background:transparent;border:0;color:#a64a34;font-size:10px;font-weight:700;padding:4px 0}.username-field[hidden]{display:none}
+.auth-tabs{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:4px;margin:18px 0 16px;background:#f4eee7;border-radius:10px}.auth-tabs button{border:0;background:transparent;border-radius:7px;padding:10px;color:#89786b;font-size:11px;font-weight:700}.auth-tabs button.active{color:#a9432e;background:#fffefa;box-shadow:0 2px 5px #33211612}
 
