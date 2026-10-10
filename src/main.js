@@ -1,7 +1,9 @@
 import Phaser from 'phaser';
 import { initializeApp, getApps } from 'firebase/app';
-import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, sendPasswordResetEmail, signOut, setPersistence, browserLocalPersistence, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, runTransaction, setDoc, getDoc } from 'firebase/firestore';
+import { getAuth, createUserWithEmailAndPassword, deleteUser, signInWithEmailAndPassword, sendPasswordResetEmail, signOut, setPersistence, browserLocalPersistence, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, doc, getDoc, getDocs, limit, orderBy, query, runTransaction, setDoc, updateDoc, where, writeBatch } from 'firebase/firestore';
+import { getDatabase, onDisconnect, onValue, push as pushRealtime, ref as realtimeRef, set as setRealtime } from 'firebase/database';
+import PizzeriaScene from './pizzeria-scene.js';
 import './style.css';
 
 const KEY = 'flame-dough-save-v1';
@@ -47,16 +49,24 @@ const fresh = () => ({ user: null, money: 250, gems: 0, selected: 'classic', sto
 let state = load();
 let scene;
 let noticeTimer;
-const firebaseConfig={apiKey:import.meta.env.VITE_FIREBASE_API_KEY,authDomain:import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,projectId:import.meta.env.VITE_FIREBASE_PROJECT_ID,appId:import.meta.env.VITE_FIREBASE_APP_ID};
-const firebaseReady=Object.values(firebaseConfig).every(Boolean);
+const firebaseConfig={apiKey:import.meta.env.VITE_FIREBASE_API_KEY,authDomain:import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,projectId:import.meta.env.VITE_FIREBASE_PROJECT_ID,appId:import.meta.env.VITE_FIREBASE_APP_ID,...(import.meta.env.VITE_FIREBASE_DATABASE_URL?{databaseURL:import.meta.env.VITE_FIREBASE_DATABASE_URL}:{})};
+const firebaseReady=[firebaseConfig.apiKey,firebaseConfig.authDomain,firebaseConfig.projectId,firebaseConfig.appId].every(Boolean);
 const fbApp=firebaseReady?(getApps()[0]||initializeApp(firebaseConfig)):null;
 const auth=fbApp?getAuth(fbApp):null;
 const db=fbApp?getFirestore(fbApp):null;
+const realtimeDb=fbApp&&firebaseConfig.databaseURL?getDatabase(fbApp,firebaseConfig.databaseURL):null;
+const socialData={loading:false,error:'',ranking:[],friends:[],requests:[],onlinePlayers:[]};
+let activeView='game';
+let publicProfileSyncAt=0;
+let publicProfileSyncPending=false;
+let presenceConnectionListener=null;
+let onlinePlayersListener=null;
+let activePresenceRef=null;
 
 function readLocalAccounts(){try{return JSON.parse(localStorage.getItem(LOCAL_ACCOUNTS_KEY)||'{}');}catch{return {};}}
 function localProgressKey(uid){return `${KEY}:${uid}`;}
 function load() { try { const sessionId=localStorage.getItem(LOCAL_SESSION_KEY),account=Object.values(readLocalAccounts()).find(item=>item.id===sessionId);if(account){const raw=localStorage.getItem(localProgressKey(account.id));return {...fresh(),...(raw?JSON.parse(raw):{}),user:{uid:account.id,username:account.username,email:account.email,localAccount:true},startedAt:Date.now()};}const raw = localStorage.getItem(KEY); if (raw) {const saved=JSON.parse(raw);return {...fresh(),...saved,user:saved.user?.uid? saved.user:null,startedAt:Date.now()};} } catch {} return fresh(); }
-function save() { state.savedAt = Date.now();const serialized=JSON.stringify(state);if(state.user?.localAccount){localStorage.setItem(localProgressKey(state.user.uid),serialized);localStorage.setItem(LOCAL_SESSION_KEY,state.user.uid);}else localStorage.setItem(KEY,serialized);if(db&&auth?.currentUser) setDoc(doc(db,'users',auth.currentUser.uid),{username:state.user?.username,email:state.user?.email,progress:JSON.parse(JSON.stringify({...state,user:null})),updatedAt:Date.now()},{merge:true}).catch(()=>{}); }
+function save() { state.savedAt = Date.now();const serialized=JSON.stringify(state);if(state.user?.localAccount){localStorage.setItem(localProgressKey(state.user.uid),serialized);localStorage.setItem(LOCAL_SESSION_KEY,state.user.uid);}else localStorage.setItem(KEY,serialized);if(db&&auth?.currentUser){setDoc(doc(db,'users',auth.currentUser.uid),{username:state.user?.username,email:state.user?.email,progress:JSON.parse(JSON.stringify({...state,user:null})),updatedAt:Date.now()},{merge:true}).catch(()=>{});publishPlayerProfile();} }
 function passwordDigest(password,salt){return crypto.subtle.importKey('raw',new TextEncoder().encode(password),'PBKDF2',false,['deriveBits']).then(key=>crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:210000,hash:'SHA-256'},key,256)).then(bits=>btoa(String.fromCharCode(...new Uint8Array(bits))));}
 function toBase64(bytes){return btoa(String.fromCharCode(...bytes));}
 function fromBase64(value){return Uint8Array.from(atob(value),c=>c.charCodeAt(0));}
@@ -85,6 +95,71 @@ function authErrorMessage(error) {
   };
   return messages[error?.code] || error?.message || 'No se pudo completar la solicitud. Inténtalo de nuevo.';
 }
+function publishPlayerProfile(force=false) {
+  const player=auth?.currentUser;
+  if(!db||!player||!state.user||state.user.localAccount||publicProfileSyncPending||(!force&&Date.now()-publicProfileSyncAt<30000))return;
+  publicProfileSyncPending=true;
+  setDoc(doc(db,'playerProfiles',player.uid),{
+    uid:player.uid,username:state.user.username,usernameKey:normalizeUsername(state.user.username),
+    sold:state.sold,revenue:state.revenue,reputation:state.reputation,stars:state.stars,
+    playTime:state.totalSeconds,updatedAt:Date.now(),
+  },{merge:true}).then(()=>{publicProfileSyncAt=Date.now();if(activePresenceRef)setRealtime(activePresenceRef,{connectedAt:Date.now()}).catch(()=>{});}).catch(()=>{}).finally(()=>{publicProfileSyncPending=false;});
+}
+function refreshSocialView(){if(activeView==='social'){const view=document.querySelector('#view');if(view)view.innerHTML=socialView();}}
+async function stopPresence(){presenceConnectionListener?.();onlinePlayersListener?.();presenceConnectionListener=null;onlinePlayersListener=null;socialData.onlinePlayers=[];const connection=activePresenceRef;activePresenceRef=null;if(connection){await onDisconnect(connection).cancel().catch(()=>{});await setRealtime(connection,null).catch(()=>{});}}
+function startPresence(){
+  const player=auth?.currentUser;
+  if(!realtimeDb||!player||presenceConnectionListener)return;
+  const connectionState=realtimeRef(realtimeDb,'.info/connected');
+  presenceConnectionListener=onValue(connectionState,async(snapshot)=>{
+    if(snapshot.val()!==true)return;
+    const connection=pushRealtime(realtimeRef(realtimeDb,`presence/${player.uid}/connections`));
+    try{await onDisconnect(connection).remove();activePresenceRef=connection;await setRealtime(connection,{connectedAt:Date.now()});}
+    catch(error){socialData.error=authErrorMessage(error);refreshSocialView();}
+  });
+  onlinePlayersListener=onValue(realtimeRef(realtimeDb,'presence'),async(snapshot)=>{
+    const ids=Object.entries(snapshot.val()||{}).filter(([,value])=>Object.keys(value?.connections||{}).length>0).map(([uid])=>uid);
+    const profiles=await Promise.all(ids.map(async(uid)=>{try{const profile=await getDoc(doc(db,'playerProfiles',uid));return profile.exists()?{uid,...profile.data()}:null;}catch{return null;}}));
+    socialData.onlinePlayers=profiles.filter(Boolean).sort((a,b)=>String(a.username||'').localeCompare(String(b.username||'')));
+    refreshSocialView();
+  },(error)=>{socialData.error=authErrorMessage(error);refreshSocialView();});
+}
+async function loadSocialData(){
+  if(!db||!auth?.currentUser||state.user?.localAccount){socialData.error='Inicia sesión con una cuenta Firebase para usar la comunidad.';socialData.loading=false;refreshSocialView();return;}
+  socialData.loading=true;socialData.error='';refreshSocialView();
+  try{
+    const [rankingSnapshot,friendsSnapshot,requestsSnapshot]=await Promise.all([
+      getDocs(query(collection(db,'playerProfiles'),orderBy('sold','desc'),limit(50))),
+      getDocs(collection(db,'users',auth.currentUser.uid,'friends')),
+      getDocs(collection(db,'users',auth.currentUser.uid,'friendRequests')),
+    ]);
+    socialData.ranking=rankingSnapshot.docs.map((item)=>({uid:item.id,...item.data()}));
+    socialData.friends=friendsSnapshot.docs.map((item)=>({uid:item.id,...item.data()}));
+    socialData.requests=requestsSnapshot.docs.map((item)=>({id:item.id,...item.data()})).filter((item)=>item.status==='pending');
+  }catch(error){socialData.error=authErrorMessage(error);}
+  finally{socialData.loading=false;refreshSocialView();}
+}
+async function sendFriendRequest(username){
+  const player=auth?.currentUser,key=normalizeUsername(username);
+  if(!db||!player||!key)throw new Error('Escribe el nombre de usuario de la persona que quieres agregar.');
+  const result=await getDocs(query(collection(db,'playerProfiles'),where('usernameKey','==',key),limit(1)));
+  if(result.empty)throw new Error('No encontramos ese nombre de usuario.');
+  const target=result.docs[0];
+  if(target.id===player.uid)throw new Error('No puedes enviarte una solicitud a ti mismo.');
+  if((await getDoc(doc(db,'users',player.uid,'friends',target.id))).exists())throw new Error('Esa persona ya está en tu lista de amigos.');
+  await setDoc(doc(db,'users',target.id,'friendRequests',player.uid),{fromUid:player.uid,toUid:target.id,username:state.user.username,status:'pending',createdAt:Date.now()});
+}
+async function respondToFriendRequest(request,accept){
+  const player=auth?.currentUser;
+  if(!db||!player||!request?.fromUid)throw new Error('No se pudo identificar la solicitud.');
+  const requestRef=doc(db,'users',player.uid,'friendRequests',request.id);
+  if(!accept){await updateDoc(requestRef,{status:'rejected',respondedAt:Date.now()});return;}
+  const batch=writeBatch(db),now=Date.now();
+  batch.set(doc(db,'users',player.uid,'friends',request.fromUid),{uid:request.fromUid,username:request.username,addedAt:now});
+  batch.set(doc(db,'users',request.fromUid,'friends',player.uid),{uid:player.uid,username:state.user.username,addedAt:now});
+  batch.update(requestRef,{status:'accepted',respondedAt:now});
+  await batch.commit();
+}
 function scoreStars() { state.stars = Math.min(5, 2 + Math.floor(state.reputation / 35)); }
 function setScene() { if (scene) scene.refresh(state); }
 function rankLabel() { return ['','', 'Favorita del barrio', 'Pizzería popular', 'Imperio gastronómico', 'Leyenda de la pizza'][state.stars]; }
@@ -96,18 +171,20 @@ function render() {
   if (!state.user) { app.innerHTML = `<main class="auth-page"><section class="auth-card"><div class="brand-mark">🔥</div><p class="eyebrow">PIZZERÍA TYCOON</p><h1>Flame <i>&</i> Dough</h1><p class="muted">Tu receta para un imperio empieza aquí.</p><div class="auth-tabs"><button type="button" class="active" data-auth-mode="login">Ingresar</button><button type="button" data-auth-mode="register">Crear cuenta</button></div><form id="auth-form" data-mode="login"><label class="username-field" hidden>Nombre de usuario<input name="username" placeholder="Tu nombre" minlength="2" /></label><label>Correo electrónico<input name="email" type="email" placeholder="tu@correo.com" autocomplete="email" required /></label><label>Contraseña<input name="password" type="password" minlength="6" placeholder="Mínimo 6 caracteres" autocomplete="current-password" required /></label><button class="primary full" type="submit">Ingresar <span>→</span></button></form><div class="auth-links"><button type="button" data-action="forgot-password">Olvidé mi contraseña</button></div><p class="hint">${firebaseReady?'Crea una cuenta Firebase y úsala desde tus dispositivos.':'Puedes crear una cuenta local para ingresar desde este dispositivo. Para iniciar sesión desde otros dispositivos, hay que conectar Firebase.'}</p><div id="toast" class="toast" role="status" aria-live="polite"></div></section></main>`; attachEvents(); return; }
   app.innerHTML = `<div class="app-shell">
     <header class="topbar"><a class="brand" href="#"><span class="brand-icon">🔥</span><span>FLAME <i>&</i> DOUGH<small> PIZZERÍA TYCOON</small></span></a><div class="top-stats"><div class="stat-chip"><small>CAJA</small><b id="money">${money()}</b></div><div class="stat-chip reputation"><small>REPUTACIÓN</small><b id="stars">${'★'.repeat(state.stars)}${'☆'.repeat(5-state.stars)}</b></div><button class="icon-btn" data-action="pause" title="Pausar">Ⅱ</button><button class="avatar" data-action="settings" title="Configuración">${state.user.username.slice(0,1).toUpperCase()}</button></div></header>
-    <main class="layout"><aside class="sidebar"><div class="day-card"><span>📅 JORNADA <b id="day-count">${Math.floor(elapsed()/60)+1}</b></span><div class="day-progress"><i></i></div><small>La ciudad nunca duerme</small></div><nav>${[['game','🏠','Pizzería'],['upgrades','🛠️','Mejoras'],['lab','🧪','Laboratorio'],['missions','🎯','Objetivos'],['stats','📊','Estadísticas'],['settings','⚙️','Configuración']].map(([id,icon,label])=>`<button class="nav-item ${id==='game'?'active':''}" data-view="${id}"><span>${icon}</span>${label}${id==='missions' && state.missionClaims.length < missions.length ? '<i class="nav-dot"></i>':''}</button>`).join('')}</nav><div class="sidebar-bottom"><div class="profile"><div class="avatar mini">${state.user.username.slice(0,1).toUpperCase()}</div><div><b>${escapeHtml(state.user.username)}</b><small>Dueña de la pizzería</small></div></div><button class="text-btn" data-action="logout">↪ Cerrar sesión</button></div></aside>
+    <main class="layout"><aside class="sidebar"><div class="day-card"><span>📅 JORNADA <b id="day-count">${Math.floor(elapsed()/60)+1}</b></span><div class="day-progress"><i></i></div><small>La ciudad nunca duerme</small></div><nav>${[['game','🏠','Pizzería'],['social','👥','Comunidad'],['upgrades','🛠️','Mejoras'],['lab','🧪','Laboratorio'],['missions','🎯','Objetivos'],['stats','📊','Estadísticas'],['settings','⚙️','Configuración']].map(([id,icon,label])=>`<button class="nav-item ${id==='game'?'active':''}" data-view="${id}"><span>${icon}</span>${label}${id==='missions' && state.missionClaims.length < missions.length ? '<i class="nav-dot"></i>':''}</button>`).join('')}</nav><div class="sidebar-bottom"><div class="profile"><div class="avatar mini">${state.user.username.slice(0,1).toUpperCase()}</div><div><b>${escapeHtml(state.user.username)}</b><small>Dueña de la pizzería</small></div></div><button class="text-btn" data-action="logout">↪ Cerrar sesión</button></div></aside>
     <section class="content"><div id="view"></div></section></main><div id="toast" class="toast"></div><div id="modal-root"></div></div>`;
   showView('game'); attachEvents(); setScene();
 }
 function escapeHtml(s='') { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function showView(id) {
+  activeView=id;
   if(id!=='game'&&gameInstance){gameInstance.destroy(true);gameInstance=null;scene=null;}
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === id));
   const view = document.querySelector('#view'); if (!view) return;
-  if (id === 'game') view.innerHTML = gameView(); if (id === 'upgrades') view.innerHTML = upgradesView(); if (id === 'lab') view.innerHTML = labView(); if (id === 'missions') view.innerHTML = missionsView(); if (id === 'stats') view.innerHTML = statsView(); if (id === 'settings') view.innerHTML = settingsView();
+  if (id === 'game') view.innerHTML = gameView(); if (id === 'social') view.innerHTML = socialView(); if (id === 'upgrades') view.innerHTML = upgradesView(); if (id === 'lab') view.innerHTML = labView(); if (id === 'missions') view.innerHTML = missionsView(); if (id === 'stats') view.innerHTML = statsView(); if (id === 'settings') view.innerHTML = settingsView();
   if (id === 'game') mountGame();
   attachEvents();
+  if (id === 'social') loadSocialData();
 }
 function gameView() { const current=recipes.find(r=>r.id===state.selected)||recipes[0]; const activeEvent=state.event && (state.eventUntil>Date.now()||state.systemDown)?state.event:null;
   return `<div class="view-head"><div><p class="eyebrow">${new Date().toLocaleDateString('es-PE',{weekday:'long',day:'numeric',month:'long'})}</p><h1>¡Buen día, ${escapeHtml(state.user.username)}! <span>🍕</span></h1><p class="muted">${rankLabel()} · Hoy puede ser un gran día para vender.</p></div><button class="secondary" data-action="pause">Ⅱ <span>${state.paused?'Reanudar':'Pausar'}</span></button></div>
@@ -128,6 +205,17 @@ function labView() { return `<div class="view-head"><div><p class="eyebrow">INNO
 function missionsView() { return `<div class="view-head"><div><p class="eyebrow">UN PASO MÁS HACIA LA LEYENDA</p><h1>Objetivos <span>🎯</span></h1><p class="muted">Misiones diarias · se renuevan al cambiar el día local.</p></div></div><div class="mission-list">${missions.map(m=>{const done=m.done(state),claimed=state.missionClaims.includes(m.id);return `<div class="card mission-row ${claimed?'complete':''}"><span class="mission-check">${claimed?'✓':done?'🎁':'○'}</span><div class="mission-copy"><b>${m.text}</b><small>${claimed?'Recompensa cobrada':done?'¡Completada! Reclama tu recompensa':missionProgress(m)}</small></div><strong>+${money(m.reward)}</strong><button class="${done&&!claimed?'primary':'secondary'}" data-action="claim" data-id="${m.id}" ${!done||claimed?'disabled':''}>${claimed?'Lista':done?'Cobrar':'En curso'}</button></div>`}).join('')}</div><div class="section-title spaced"><div><h2>Metas de toda la vida</h2><p>Trofeos que cuentan tu historia.</p></div></div><div class="trophy-grid">${[['rich','💰','Millonario','$100,000 en caja',state.money>=100000],['legend','⭐','Leyenda','Alcanza 5 estrellas',state.stars>=5],['empire','🏙️','Imperio','Abre 3 sucursales',state.expansions>=5],['baker','🍕','Panadero','Vende 10,000 pizzas',state.sold>=10000]].map(([id,icon,name,desc,done])=>`<div class="card trophy ${done?'earned':''}"><span>${icon}</span><b>${name}</b><small>${desc}</small><i>${done?'DESBLOQUEADO':'POR CONSEGUIR'}</i></div>`).join('')}</div>`; }
 function missionProgress(m) { if(m.id==='sell50')return `${Math.min(50,state.sold)} / 50 pizzas`;if(m.id==='star4')return `${state.stars} / 4 estrellas`;if(m.id==='staff5')return `${totalStaff()} / 5 empleados`;if(m.id==='research2')return `${state.researched.length} / 2 tecnologías`;return `${money(state.marketingSpent)} / $5,000 invertidos`; }
 function statsView() { const hours=Math.floor(elapsed()/3600), mins=Math.floor(elapsed()%3600/60); return `<div class="view-head"><div><p class="eyebrow">CADA PIZZA CUENTA</p><h1>Estadísticas <span>📊</span></h1><p class="muted">El progreso completo de tu imperio.</p></div></div><div class="stats-grid">${[['🍕','Pizzas vendidas',state.sold],['💵','Ingresos totales',money(state.revenue)],['👥','Empleados contratados',totalStaff()],['🏪','Expansiones completadas',state.expansions],['🧪','Tecnologías investigadas',state.researched.length],['⏱️','Tiempo jugado',`${hours}h ${mins}m`],['🔥','Mejor racha',`${state.bestStreak} pizzas`],['⭐','Reputación',`${state.reputation} puntos`]].map(([i,n,v])=>`<div class="card stat-card"><span>${i}</span><small>${n}</small><b>${v}</b></div>`).join('')}</div><div class="card stats-note"><span>📈</span><div><b>Tu negocio va tomando forma.</b><p>${state.sold?`Ya has servido ${state.sold} pizzas y ganado ${money(state.revenue)} en ventas.`:'Sirve tu primera pizza y aquí verás crecer tus números.'} Tu mejor racha es de ${state.bestStreak} ventas seguidas.</p></div></div>`; }
+function socialView(){
+  const currentUid=auth?.currentUser?.uid,onlineIds=new Set(socialData.onlinePlayers.map((player)=>player.uid));
+  const identityRequired=!firebaseReady||state.user?.localAccount;
+  return `<div class="view-head"><div><p class="eyebrow">JUEGA EN COMUNIDAD</p><h1>Comunidad <span>👥</span></h1><p class="muted">Encuentra jugadores, agrega amigos y sube en la clasificación.</p></div><button class="secondary" data-action="refresh-social" ${socialData.loading?'disabled':''}>${socialData.loading?'Actualizando…':'↻ Actualizar'}</button></div>
+  ${identityRequired?'<div class="card social-notice"><b>Conecta una cuenta Firebase</b><p>La comunidad, los amigos y la clasificación funcionan con cuentas en la nube. Cierra sesión y crea o inicia sesión con tu cuenta Firebase.</p></div>':socialData.error?`<div class="card social-notice"><b>No se pudo cargar la comunidad</b><p>${escapeHtml(socialData.error)}</p><button class="secondary" data-action="refresh-social">Intentar de nuevo</button></div>`:''}
+  <div class="social-layout"><div class="social-main"><section class="card social-panel"><div class="social-panel-head"><div><p class="eyebrow">EN ESTE MOMENTO</p><h2>Jugadores conectados</h2></div><span class="pill">${realtimeDb?`${socialData.onlinePlayers.length} en línea`:'PRESENCIA NO CONFIGURADA'}</span></div>${!realtimeDb?'<p class="social-empty">Para ver quién está en línea en tiempo real, activa Realtime Database en Firebase y agrega `VITE_FIREBASE_DATABASE_URL` en Vercel.</p>':socialData.onlinePlayers.length?`<div class="player-list">${socialData.onlinePlayers.map((player)=>{const isFriend=socialData.friends.some((friend)=>friend.uid===player.uid);return `<article class="player-row"><span class="player-avatar">${escapeHtml((player.username||'?').slice(0,1).toUpperCase())}<i></i></span><div class="player-info"><b>${escapeHtml(player.username||'Chef')}</b><small>⭐ ${Number(player.stars)||0} · 🍕 ${Number(player.sold)||0} pizzas · ${Number(player.reputation)||0} reputación</small></div>${player.uid===currentUid?'<span class="pill">TÚ</span>':isFriend?'<span class="pill friend-pill">AMIGO</span>':`<button class="tiny-btn" data-action="send-friend-request" data-username="${escapeHtml(player.username||'')}">＋ Agregar</button>`}</article>`;}).join('')}</div>`:'<p class="social-empty">Todavía no hay otros jugadores conectados. Invita a tus amigos para encontrarlos aquí.</p>'}</section>
+  <section class="card social-panel"><div class="social-panel-head"><div><p class="eyebrow">LOS MEJORES CHEFS</p><h2>Clasificación</h2></div><span class="pill">POR PIZZAS VENDIDAS</span></div>${socialData.ranking.length?`<div class="leaderboard">${socialData.ranking.map((player,index)=>`<article class="leader-row ${player.uid===currentUid?'leader-self':''}"><span class="leader-rank">${index<3?['🥇','🥈','🥉'][index]:`#${index+1}`}</span><span class="player-avatar">${escapeHtml((player.username||'?').slice(0,1).toUpperCase())}</span><div class="player-info"><b>${escapeHtml(player.username||'Chef')}${player.uid===currentUid?' · Tú':''}</b><small>⭐ ${Number(player.stars)||0} estrellas · ${Number(player.reputation)||0} reputación</small></div><strong>${Number(player.sold)||0}<small> pizzas</small></strong></article>`).join('')}</div>`:socialData.loading?'<p class="social-empty">Cargando clasificación…</p>':'<p class="social-empty">La clasificación aparecerá cuando haya perfiles de jugadores.</p>'}</section></div>
+  <aside class="social-side"><section class="card social-panel"><p class="eyebrow">HAZ EQUIPO</p><h2>Agregar amigo</h2><form id="friend-form" class="friend-form"><label for="friend-username">Nombre de usuario</label><div><input id="friend-username" name="username" placeholder="Ej. pizzachef" minlength="2" required ${identityRequired?'disabled':''}><button class="primary" type="submit" ${identityRequired?'disabled':''}>Enviar</button></div></form><p class="social-help">Busca el nombre de usuario exacto de otra persona.</p></section>
+  <section class="card social-panel"><div class="social-panel-head"><div><p class="eyebrow">TU CÍRCULO</p><h2>Amigos</h2></div><span class="pill">${socialData.friends.length}</span></div>${socialData.friends.length?`<div class="player-list">${socialData.friends.map((friend)=>`<article class="player-row"><span class="player-avatar">${escapeHtml((friend.username||'?').slice(0,1).toUpperCase())}${onlineIds.has(friend.uid)?'<i></i>':''}</span><div class="player-info"><b>${escapeHtml(friend.username||'Chef')}</b><small>${onlineIds.has(friend.uid)?'En línea':'Desconectado'}</small></div></article>`).join('')}</div>`:'<p class="social-empty">Todavía no agregas amigos.</p>'}</section>
+  <section class="card social-panel"><div class="social-panel-head"><div><p class="eyebrow">SOLICITUDES</p><h2>Invitaciones recibidas</h2></div><span class="pill">${socialData.requests.length}</span></div>${socialData.requests.length?`<div class="player-list">${socialData.requests.map((request)=>`<article class="player-row request-row"><div class="player-info"><b>${escapeHtml(request.username||'Chef')}</b><small>Quiere agregarte como amigo</small></div><button class="tiny-btn" data-action="accept-friend" data-request-id="${escapeHtml(request.id)}" data-from-uid="${escapeHtml(request.fromUid)}" data-username="${escapeHtml(request.username||'Chef')}">Aceptar</button><button class="text-btn" data-action="reject-friend" data-request-id="${escapeHtml(request.id)}">Rechazar</button></article>`).join('')}</div>`:'<p class="social-empty">No tienes solicitudes pendientes.</p>'}</section></aside></div>`;
+}
 function settingsView() { return `<div class="view-head"><div><p class="eyebrow">A TU MANERA</p><h1>Configuración <span>⚙️</span></h1><p class="muted">Ajusta tu experiencia y administra tu cuenta.</p></div></div><div class="settings-list"><div class="card setting-row"><div><b>🔊 Efectos de sonido</b><small>Sonido al vender y completar objetivos.</small></div><button class="toggle ${state.settings.sound?'on':''}" data-action="sound">${state.settings.sound?'Activado':'Desactivado'}</button></div><div class="card setting-row"><div><b>🔉 Volumen</b><small>Ajusta el volumen de juego.</small></div><input type="range" min="0" max="100" value="${state.settings.volume}" data-setting="volume"><b>${state.settings.volume}%</b></div><div class="card setting-row"><div><b>🌐 Idioma</b><small>Idioma de la interfaz.</small></div><select data-setting="language"><option value="es" selected>Español</option><option value="en">English (próximamente)</option></select></div><div class="card setting-row"><div><b>☁️ Cuenta y sincronización</b><small>${state.user.localAccount?'Cuenta local: funciona solo en este dispositivo.':'Cuenta Firebase: sesión y progreso sincronizados en la nube.'}</small></div><span class="pill">${navigator.onLine?'EN LÍNEA':'SIN CONEXIÓN'}</span></div><div class="card setting-row"><div><b>🛍️ Tienda de la pizzería</b><small>Gemas, paquetes, pase y cosméticos.</small></div><button class="secondary" data-action="store">Abrir tienda</button></div><div class="card setting-row"><div><b>🛡️ Panel de administración</b><small>Vista local de analítica para el prototipo.</small></div><button class="secondary" data-action="admin">Abrir dashboard</button></div><div class="card setting-row"><div><b>💾 Guardado</b><small>Último guardado ${new Date(state.savedAt).toLocaleTimeString('es-PE')} · auto guardado cada 5 segundos.</small></div><button class="secondary" data-action="save">Guardar ahora</button></div><button class="danger full" data-action="logout">Cerrar sesión</button></div>`; }
 
 function attachEvents() {
@@ -138,11 +226,14 @@ function attachEvents() {
     const authTab=ev.target.closest('[data-auth-mode]');if(authTab){const form=document.querySelector('#auth-form'),mode=authTab.dataset.authMode,register=mode==='register';form.dataset.mode=mode;const user=form.querySelector('.username-field'),password=form.querySelector('[name=password]'),submit=form.querySelector('[type=submit]');user.hidden=!register;user.querySelector('input').required=register;password.autocomplete=register?'new-password':'current-password';submit.innerHTML=`${register?'Crear mi cuenta':'Ingresar'} <span>→</span>`;document.querySelectorAll('[data-auth-mode]').forEach(tab=>tab.classList.toggle('active',tab.dataset.authMode===mode));return;}
     const button=ev.target.closest('[data-action]'); if(!button)return;
     const {action,id}=button.dataset; const index=Number(button.dataset.index);
+    if(action==='refresh-social'){await loadSocialData();return;}
+    if(action==='send-friend-request'){try{await sendFriendRequest(button.dataset.username);notify('Solicitud de amistad enviada.');await loadSocialData();}catch(error){notify(error.message||'No se pudo enviar la solicitud.');}return;}
+    if(action==='accept-friend'||action==='reject-friend'){const request={id:button.dataset.requestId,fromUid:button.dataset.fromUid,username:button.dataset.username};try{await respondToFriendRequest(request,action==='accept-friend');notify(action==='accept-friend'?'Ahora son amigos.':'Solicitud rechazada.');await loadSocialData();}catch(error){notify(authErrorMessage(error));}return;}
     if(action==='make') await makePizza(button);
     if(action==='settings')showView('settings');
     if(action==='repair')repairSystem();
     if(action==='pause'){state.paused=!state.paused;showView('game');notify(state.paused?'Juego en pausa':'¡A cocinar!');}
-    if(action==='logout'){const hadFirebase=!!auth?.currentUser;if(state.user?.localAccount){save();localStorage.removeItem(LOCAL_SESSION_KEY);state.user=null;}else{state.user=null;state.paused=false;save();}if(hadFirebase)await signOut(auth).catch(()=>{});render();}
+    if(action==='logout'){const hadFirebase=!!auth?.currentUser;if(hadFirebase)await stopPresence();if(state.user?.localAccount){save();localStorage.removeItem(LOCAL_SESSION_KEY);state.user=null;}else{state.user=null;state.paused=false;save();}if(hadFirebase)await signOut(auth).catch(()=>{});render();}
     if(action==='forgot-password'){const email=document.querySelector('#auth-form [name=email]').value.trim();if(!email){notify('Escribe tu correo electrónico primero.');return;}if(!auth){notify('La recuperación por correo requiere Firebase.');return;}try{await sendPasswordResetEmail(auth,email);notify('Te enviamos un enlace para restablecer la contraseña. Revisa también el correo no deseado.');}catch(error){notify(authErrorMessage(error));}}
     if(action==='hire')hire(id);
     if(action==='train')train(id);
@@ -161,16 +252,61 @@ function attachEvents() {
     if(action==='close-modal')document.querySelector('#modal-root').innerHTML='';
     if(action==='buy-demo')demoPurchase(button.dataset.product);
   };
-  app.onsubmit = async (ev) => { if(ev.target.id==='auth-form'){ev.preventDefault();const form=ev.target,submit=form.querySelector('[type=submit]'),fd=new FormData(form),email=String(fd.get('email')).trim(),password=String(fd.get('password')),register=form.dataset.mode==='register',username=String(fd.get('username')||'').trim();if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){notify('Escribe un correo válido.');return;}if(password.length<6){notify('La contraseña debe tener al menos 6 caracteres.');return;}if(register&&username.length<2){notify('El nombre de usuario debe tener al menos 2 caracteres.');return;}submit.disabled=true;submit.textContent=register?'Creando cuenta…':'Ingresando…';try{if(auth){await setPersistence(auth,browserLocalPersistence);if(register){const credential=await createUserWithEmailAndPassword(auth,email,password),normalized=normalizeUsername(username);if(normalized.length<2)throw new Error('El nombre debe contener letras o números.');await runTransaction(db,async(tx)=>{const ref=doc(db,'usernames',normalized),existing=await tx.get(ref);if(existing.exists())throw new Error('Ese nombre de usuario ya está ocupado.');tx.set(ref,{uid:credential.user.uid,username});});state.user={uid:credential.user.uid,username,email};}else{const credential=await signInWithEmailAndPassword(auth,email,password),remote=await getDoc(doc(db,'users',credential.user.uid));if(remote.exists()){const data=remote.data();if(data.progress)state={...fresh(),...data.progress,startedAt:Date.now()};state.user={uid:credential.user.uid,username:data.username||email.split('@')[0],email};}else state.user={uid:credential.user.uid,username:email.split('@')[0],email};}state.startedAt=Date.now();save();}else if(register){await registerLocalAccount({email,password,username});}else{await loginLocalAccount({email,password});}render();notify(register?'Cuenta creada. Ya puedes jugar.':'Sesión iniciada. ¡Bienvenido!');}catch(error){if(register&&auth?.currentUser&&!state.user)await signOut(auth).catch(()=>{});notify(auth?authErrorMessage(error):error.message||'No se pudo completar el acceso.');}finally{if(document.body.contains(submit)){submit.disabled=false;submit.innerHTML=`${register?'Crear mi cuenta':'Ingresar'} <span>→</span>`;}}} };
+  app.onsubmit = async (ev) => {
+    if(ev.target.id==='friend-form'){
+      ev.preventDefault();
+      const form=ev.target,submit=form.querySelector('[type=submit]'),username=String(new FormData(form).get('username')||'').trim();
+      submit.disabled=true;submit.textContent='Enviando…';
+      try{await sendFriendRequest(username);form.reset();notify('Solicitud de amistad enviada.');await loadSocialData();}
+      catch(error){notify(error.message||'No se pudo enviar la solicitud.');}
+      finally{if(document.body.contains(submit)){submit.disabled=false;submit.textContent='Enviar';}}
+      return;
+    }
+    if(ev.target.id!=='auth-form')return;
+    ev.preventDefault();
+    const form=ev.target,submit=form.querySelector('[type=submit]'),fd=new FormData(form),email=String(fd.get('email')).trim(),password=String(fd.get('password')),register=form.dataset.mode==='register',username=String(fd.get('username')||'').trim();
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){notify('Escribe un correo válido.');return;}
+    if(password.length<6){notify('La contraseña debe tener al menos 6 caracteres.');return;}
+    if(register&&username.length<2){notify('El nombre de usuario debe tener al menos 2 caracteres.');return;}
+    submit.disabled=true;submit.textContent=register?'Creando cuenta…':'Ingresando…';
+    let createdFirebaseUser=null;
+    try{
+      if(auth){
+        await setPersistence(auth,browserLocalPersistence);
+        if(register){
+          const credential=await createUserWithEmailAndPassword(auth,email,password);createdFirebaseUser=credential.user;
+          const normalized=normalizeUsername(username);
+          if(normalized.length<2)throw new Error('El nombre debe contener letras o números.');
+          await runTransaction(db,async(tx)=>{const usernameRef=doc(db,'usernames',normalized),existing=await tx.get(usernameRef);if(existing.exists())throw new Error('Ese nombre de usuario ya está ocupado.');tx.set(usernameRef,{uid:credential.user.uid,username});});
+          state.user={uid:credential.user.uid,username,email};
+        }else{
+          const credential=await signInWithEmailAndPassword(auth,email,password),remote=await getDoc(doc(db,'users',credential.user.uid));
+          if(remote.exists()){const data=remote.data();if(data.progress)state={...fresh(),...data.progress,startedAt:Date.now()};state.user={uid:credential.user.uid,username:data.username||email.split('@')[0],email};}
+          else state.user={uid:credential.user.uid,username:email.split('@')[0],email};
+        }
+        state.startedAt=Date.now();save();
+      }else if(register)await registerLocalAccount({email,password,username});
+      else await loginLocalAccount({email,password});
+      render();notify(register?'Cuenta creada. Ya puedes jugar.':'Sesión iniciada. ¡Bienvenido!');
+    }catch(error){
+      if(createdFirebaseUser&&!state.user)await deleteUser(createdFirebaseUser).catch(()=>signOut(auth).catch(()=>{}));
+      notify(auth?authErrorMessage(error):error.message||'No se pudo completar el acceso.');
+    }finally{if(document.body.contains(submit)){submit.disabled=false;submit.innerHTML=`${register?'Crear mi cuenta':'Ingresar'} <span>→</span>`;}}
+  };
   app.oninput=(ev)=>{if(ev.target.dataset.setting==='volume'){state.settings.volume=Number(ev.target.value);save();}};
   app.onchange=(ev)=>{if(ev.target.dataset.setting==='language'){state.settings.language=ev.target.value;save();notify('El idioma español está activo.');}};
 }
 let gameInstance;
-function mountGame(){ const host=document.querySelector('#phaser-game'); if(!host||host.dataset.mounted)return;host.dataset.mounted='1';if(gameInstance){gameInstance.destroy(true);gameInstance=null;scene=null;}
-  class PizzeriaScene extends Phaser.Scene { constructor(){super('pizzeria');} create(){this.graphics=this.add.graphics();this.emoji=this.add.text(0,0,'🍕',{fontSize:'42px'}).setOrigin(.5);this.customers=[];this.refresh(state);this.scale.on('resize',()=>this.drawRoom());this.drawRoom();} drawRoom(){const w=this.scale.width,h=this.scale.height,g=this.graphics;if(!g)return;g.clear();g.fillStyle(0xf2d7b0,1);g.fillRoundedRect(10,10,w-20,h-20,15);g.fillStyle(0x9f5131,1);g.fillRect(w*.18,h*.13,w*.64,h*.18);g.fillStyle(0xfff4df,1);g.fillRect(w*.20,h*.15,w*.60,h*.12);g.fillStyle(0x526d4f,1);g.fillRect(w*.23,h*.18,w*.18,h*.06);g.fillStyle(0xe17735,1);g.fillCircle(w*.50,h*.21,13);g.fillStyle(0x59634a,1);g.fillRect(w*.72,h*.18,w*.05,h*.12);for(let x=.25;x<.82;x+=.25){g.fillStyle(0x9c563d,1);g.fillEllipse(w*x,h*.68,68,34);g.fillStyle(0xe8b578,1);g.fillCircle(w*x,h*.62,13);}if(this.expansionCount>0){g.fillStyle(0xffca6d,1);g.fillRoundedRect(w*.79,h*.13,Math.min(w*.17,this.expansionCount*17),h*.13,6);g.fillStyle(0x7e4b2e,1);g.fillRect(w*.81,h*.16,Math.min(w*.13,this.expansionCount*15),h*.025);}if(this.expansionCount>1){g.fillStyle(0x6e8a58,1);for(let i=0;i<Math.min(4,this.expansionCount);i++)g.fillCircle(w*(.18+i*.07),h*.82,7);}if(this.expansionCount>3){g.fillStyle(0x8c5b44,1);g.fillRoundedRect(w*.76,h*.47,Math.min(56,(this.expansionCount-2)*13),h*.26,7);}} refresh(s){if(!this.graphics)return;this.expansionCount=s.expansions;this.drawRoom();const w=this.scale.width,h=this.scale.height;const count=Math.min(5,s.customers);if(this.customerGroup)this.customerGroup.destroy(true);this.customerGroup=this.add.container();for(let i=0;i<count;i++){const x=w*(.23+i*.13),y=h*.46;const face=this.add.text(x,y,['😊','😋','🙂','🤩','😄'][i],{fontSize:'27px'}).setOrigin(.5);this.customerGroup.add(face);}this.emoji.setPosition(w*.5,h*.34);this.emoji.setText(s.paused?'⏸️':'🍕');} }
-  gameInstance=new Phaser.Game({type:Phaser.CANVAS,parent:host,width:640,height:280,backgroundColor:'#f2d7b0',transparent:false,scale:{mode:Phaser.Scale.RESIZE,autoCenter:Phaser.Scale.CENTER_BOTH},scene:PizzeriaScene,render:{antialias:true}}); scene=gameInstance.scene.getScene('pizzeria');
-}
-function canAfford(amount){if(state.money<amount){notify('Todavía no tienes suficiente dinero.');return false;}state.money-=amount;return true;}
+function mountGame(){
+  const host=document.querySelector('#phaser-game');
+  if(!host||host.dataset.mounted)return;
+  host.dataset.mounted='1';
+  if(gameInstance){gameInstance.destroy(true);gameInstance=null;scene=null;}
+  const pizzeriaScene=new PizzeriaScene();
+  pizzeriaScene.setStateProvider(()=>state);
+  gameInstance=new Phaser.Game({type:Phaser.CANVAS,parent:host,width:640,height:280,backgroundColor:'#e8c69c',transparent:false,scale:{mode:Phaser.Scale.RESIZE,autoCenter:Phaser.Scale.CENTER_BOTH},scene:pizzeriaScene,render:{antialias:true}});
+  scene=pizzeriaScene;
+}function canAfford(amount){if(state.money<amount){notify('Todavía no tienes suficiente dinero.');return false;}state.money-=amount;return true;}
 function updateMoney(){const el=document.querySelector('#money');if(el)el.textContent=money();}
 function stockNeeded(recipe){return Object.entries(recipe.ingredients).every(([key,n])=>state.stock[key]>=n);}
 async function makePizza(button){if(state.paused){notify('Reanuda el juego para preparar pizzas.');return;}if(state.systemDown){notify('Repara el sistema para volver a producir.');return;}const recipe=recipes.find(r=>r.id===state.selected)||recipes[0];if(!unlocked(recipe)){notify('Esta receta todavía está bloqueada.');return;}if(!stockNeeded(recipe)){notify('Faltan ingredientes. Repón la alacena.');return;}for(const [key,n] of Object.entries(recipe.ingredients))state.stock[key]-=n;button.disabled=true;button.innerHTML='🍕 Horneando…';const cookBonus=Math.min(.65,avgLevel('cook')*.09),speed=state.researched.includes('oven')?0.5:1,wait=Math.max(700,recipe.time*1000*(1-cookBonus)*speed);await new Promise(resolve=>setTimeout(resolve,wait));const base=recipe.price*(state.researched.includes('dough')?1.3:1),managerBonus=1+state.employees.manager.length*.1,boost=state.boostUntil>Date.now()?1.5:1,premium=state.premiumUntil>Date.now()?1.5:1,delivery=state.researched.includes('delivery')&&state.employees.courier.length?1.2:1,event=state.event==='Pizza Day'&&state.eventUntil>Date.now()?3:state.event==='Fin de semana'&&state.eventUntil>Date.now()?1.3:1;const revenue=Math.round(base*managerBonus*boost*premium*delivery*event);state.money+=revenue;state.revenue+=revenue;state.sold++;state.streak++;state.bestStreak=Math.max(state.bestStreak,state.streak);state.reputation+=1+(avgLevel('server')?1:0);scoreStars();const fast=wait<5000;if(fast)state.reputation+=1;state.customers=Math.max(0,state.customers-1);state.order=null;const tip=state.employees.courier.length&&state.researched.includes('delivery')?' · delivery incluido':'';save();const toast=document.querySelector('#toast');if(toast){toast.innerHTML=`+${money(revenue)} <span class="float-pizza">🍕</span>${tip}`;toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),1300);}if(state.settings.sound)ding();button.disabled=false;button.innerHTML='Preparar y servir <span>→</span>';checkMilestones();setScene();if(document.querySelector('#view')?.innerHTML.includes('ALACENA'))showView('game');}
@@ -204,7 +340,7 @@ function showAdmin(){showModal(`<p class="eyebrow">SOLO DESARROLLO · VISTA LOCA
 document.addEventListener('click',(ev)=>{const b=ev.target.closest('[data-action="reset-save"]');if(b&&confirm('¿Borrar todo el progreso de este dispositivo?')){localStorage.removeItem(KEY);state=fresh();document.querySelector('#modal-root').innerHTML='';render();}});
 
 render();
-if(auth){setPersistence(auth,browserLocalPersistence).catch(()=>{});onAuthStateChanged(auth,async(user)=>{if(user&&!state.user){try{const remote=await getDoc(doc(db,'users',user.uid));if(remote.exists()){const data=remote.data();if(data.progress)state={...fresh(),...data.progress,startedAt:Date.now()};state.user={uid:user.uid,username:data.username||user.email?.split('@')[0]||'Chef',email:user.email};save();render();}}catch{}}});}
+if(auth){setPersistence(auth,browserLocalPersistence).catch(()=>{});onAuthStateChanged(auth,async(user)=>{if(!user){stopPresence();return;}startPresence();if(!state.user){try{const remote=await getDoc(doc(db,'users',user.uid));if(remote.exists()){const data=remote.data();if(data.progress)state={...fresh(),...data.progress,startedAt:Date.now()};state.user={uid:user.uid,username:data.username||user.email?.split('@')[0]||'Chef',email:user.email};save();render();}else{state=fresh();state.user={uid:user.uid,username:user.email?.split('@')[0]||'Chef',email:user.email};save();render();}}catch{}}});}
 setInterval(tick,1000);
 setInterval(()=>{if(state.user)save();},5000);
 if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('/sw.js').catch(()=>{});
