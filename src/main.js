@@ -49,12 +49,13 @@ const fresh = () => ({ user: null, money: 250, gems: 0, selected: 'classic', sto
 let state = load();
 let scene;
 let noticeTimer;
-const firebaseConfig={apiKey:import.meta.env.VITE_FIREBASE_API_KEY,authDomain:import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,projectId:import.meta.env.VITE_FIREBASE_PROJECT_ID,appId:import.meta.env.VITE_FIREBASE_APP_ID,...(import.meta.env.VITE_FIREBASE_DATABASE_URL?{databaseURL:import.meta.env.VITE_FIREBASE_DATABASE_URL}:{})};
+const configuredDatabaseUrl=String(import.meta.env.VITE_FIREBASE_DATABASE_URL||'').trim().replace(/\/+$/,'');
+const firebaseConfig={apiKey:import.meta.env.VITE_FIREBASE_API_KEY,authDomain:import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,projectId:import.meta.env.VITE_FIREBASE_PROJECT_ID,appId:import.meta.env.VITE_FIREBASE_APP_ID,...(configuredDatabaseUrl?{databaseURL:configuredDatabaseUrl}:{})};
 const firebaseReady=[firebaseConfig.apiKey,firebaseConfig.authDomain,firebaseConfig.projectId,firebaseConfig.appId].every(Boolean);
 const fbApp=firebaseReady?(getApps()[0]||initializeApp(firebaseConfig)):null;
 const auth=fbApp?getAuth(fbApp):null;
 const db=fbApp?getFirestore(fbApp):null;
-const realtimeDb=fbApp&&firebaseConfig.databaseURL?getDatabase(fbApp,firebaseConfig.databaseURL):null;
+const realtimeDb=(()=>{if(!fbApp||!firebaseConfig.databaseURL)return null;try{return getDatabase(fbApp,firebaseConfig.databaseURL);}catch(error){console.error('No se pudo iniciar Firebase Realtime Database. Revisa VITE_FIREBASE_DATABASE_URL.',error);return null;}})();
 const socialData={loading:false,error:'',ranking:[],friends:[],requests:[],onlinePlayers:[]};
 let activeView='game';
 let publicProfileSyncAt=0;
