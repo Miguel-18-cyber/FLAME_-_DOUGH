@@ -1,0 +1,11 @@
+{
+  "name": "Flame & Dough — Pizzería",
+  "short_name": "Flame & Dough",
+  "description": "Construye y administra tu imperio de pizzas.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#201a17",
+  "theme_color": "#201a17",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
+
