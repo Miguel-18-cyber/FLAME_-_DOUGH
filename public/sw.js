@@ -1,4 +1,4 @@
-const CACHE = 'flame-dough-v2';
+const CACHE = 'flame-dough-v3';
 const APP_SHELL = ['/', '/manifest.json', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
