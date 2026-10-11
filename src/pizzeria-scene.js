@@ -10,7 +10,7 @@ export default class PizzeriaScene extends Phaser.Scene {
   setStateProvider(provider) { this.getState = provider; }
 
   preload() {
-    this.load.svg('unity-pizzeria', '/pizzeria-unity.svg?v=unity-v2', { width: 960, height: 420 });
+    this.load.svg('unity-pizzeria', '/pizzeria-unity.svg?v=unity-v3', { width: 960, height: 420 });
   }
 
   create() {
