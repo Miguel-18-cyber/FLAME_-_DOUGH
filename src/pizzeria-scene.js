@@ -10,14 +10,14 @@ export default class PizzeriaScene extends Phaser.Scene {
   setStateProvider(provider) { this.getState = provider; }
 
   preload() {
-    this.load.svg('unity-pizzeria', '/pizzeria-unity.svg', { width: 960, height: 420 });
+    this.load.svg('unity-pizzeria', '/pizzeria-unity.svg?v=unity-v2', { width: 960, height: 420 });
   }
 
   create() {
     this.graphics = this.add.graphics();
     this.roomImage = this.add.image(0, 0, 'unity-pizzeria').setOrigin(0.5);
     this.expansionGraphics = this.add.graphics().setDepth(1);
-    this.emoji = this.add.text(0, 0, '🍕', { fontSize: '43px', shadow: { color: '#3d1f14', blur: 12, fill: true } }).setOrigin(.5);
+    this.emoji = this.add.text(0, 0, '🍕', { fontSize: '30px', shadow: { color: '#3d1f14', blur: 8, fill: true } }).setOrigin(.5);
     this.scale.on('resize', () => this.refresh(this.getState?.() || {}));
     this.refresh(this.getState?.() || {});
     this.tweens.add({ targets: this.emoji, y: this.emoji.y - 7, angle: 5, duration: 850, ease: 'Sine.inOut', yoyo: true, repeat: -1 });
@@ -50,17 +50,21 @@ export default class PizzeriaScene extends Phaser.Scene {
     this.drawRoom();
     const w = this.scale.width;
     const h = this.scale.height;
-    this.emoji.setPosition(w*.50, h*.32).setText(currentState.paused ? '⏸️' : '🍕');
+    this.emoji.setPosition(w*.50, h*.64).setText(currentState.paused ? '⏸' : '🍕');
     if (this.customerGroup) this.customerGroup.destroy(true);
     this.customerGroup = this.add.container();
-    const faces = ['😊','😋','🙂','🤩','😄'];
+    const faceColors = [0xffcf68, 0xffbd58, 0xffd87d, 0xffc45e, 0xffd06d];
     const count = Math.min(5, currentState.customers || 0);
     for (let i = 0; i < count; i++) {
       const x = w*(.30 + i*.10);
       const y = h*(.79 - (i%2)*.04);
       const shadow=this.add.graphics().fillStyle(0x402a23,.25).fillEllipse(x,y+13,24,8).setDepth(1);
       this.customerGroup.add(shadow);
-      const face = this.add.text(x,y,faces[i],{fontSize:'24px'}).setOrigin(.5).setDepth(2);
+      const face = this.add.graphics().setDepth(2);
+      face.fillStyle(faceColors[i],1).fillCircle(x,y,11);
+      face.lineStyle(1.5,0x9a552d,.8).strokeCircle(x,y,11);
+      face.fillStyle(0x493126,1).fillCircle(x-3.5,y-2,1.15).fillCircle(x+3.5,y-2,1.15);
+      face.lineStyle(1.5,0x7b3e2c,.95).lineBetween(x-3,y+4,x+3,y+4);
       this.customerGroup.add(face);
     }
   }
